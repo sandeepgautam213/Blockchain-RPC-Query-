@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"fmt"
+	"encoding/json"
 	"net/http"
 	"tron_rpc/rpc"
 )
@@ -13,13 +13,16 @@ func CurrentBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	balance, err := rpc.FetchBalance(address)
+	balanceBigInt, err := rpc.FetchBalance(address)
 	if err != nil {
 		http.Error(w, "Error fetching balance: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	balanceInt := balanceBigInt.Int64()
+	balanceTRX := float64(balanceInt) / 1e6
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf(`{"balance": "%s"}`, balance.String())))
+	resp := map[string]interface{}{
+		"balance_trx": balanceTRX,
+	}
+	json.NewEncoder(w).Encode(resp)
 }
