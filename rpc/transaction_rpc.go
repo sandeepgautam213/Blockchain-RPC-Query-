@@ -2,25 +2,22 @@ package rpc
 
 import (
 	"encoding/json"
+	"fmt"
+	"math/big"
 	"sync"
 )
 
 type Block struct {
-	Transactions []Transaction `json: "transactions"`
+	Number       string        `json:"number"`
+	Hash         string        `json:"hash"`
+	Transactions []Transaction `json:"transactions"`
 }
+
 type Transaction struct {
-	RawData struct {
-		Contract []Contract `json : "contract`
-	} `json : "raw_data"`
-}
-type Contract struct {
-	Type      string `json :"type"`
-	Parameter struct {
-		Value struct {
-			OwnerAddress string `json:"owner_address"`
-			ToAddress    string `json: "to_address`
-		} `json: "value"`
-	} `json:"parameter"`
+	Hash  string `json:"hash"`
+	From  string `json:"from"`
+	To    string `json:"to"`
+	Value string `json:"value"`
 }
 
 func FetchPayers(address string, blockRange int64) ([]string, error) {
@@ -51,37 +48,35 @@ func scanBlocks(address string, blockRange int64, handleTx func(from, to string)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	sem := make(chan struct{}, 5)
+	sem := make(chan struct{}, 5) // limit concurrency to 5
 
 	for i := latest; i >= latest-blockRange; i-- {
 		wg.Add(1)
 		sem <- struct{}{}
+
 		go func(num int64) {
 			defer func() {
 				wg.Done()
 				<-sem
-
 			}()
 
 			block, err := getBlockByNum(num)
 			if err != nil {
 				return
 			}
+
 			for _, tx := range block.Transactions {
-				for _, c := range tx.RawData.Contract {
-					if c.Type != "TransferContract" {
-						continue
-					}
-					from := c.Parameter.Value.OwnerAddress
-					to := c.Parameter.Value.ToAddress
+				from := tx.From
+				to := tx.To
 
-					mu.Lock()
-					handleTx(from, to)
-					mu.Unlock()
-
+				if from == "" || to == "" {
+					continue
 				}
-			}
 
+				mu.Lock()
+				handleTx(from, to)
+				mu.Unlock()
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -89,32 +84,76 @@ func scanBlocks(address string, blockRange int64, handleTx func(from, to string)
 }
 
 func getLatestBlockNumber() (int64, error) {
-	resp, err := post("/wallet/getnowblock", nil)
+	payload := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "eth_blockNumber",
+		"params":  []interface{}{},
+		"id":      1,
+	}
+
+	resp, err := postc(payload)
 	if err != nil {
 		return 0, err
 	}
 
-	var result struct {
-		BlockHeader struct {
-			RawData struct {
-				Number int64 `json: "number`
-			} `json: "raw_data"`
-		} `json: "block_header"`
+	var rpcResp struct {
+		Result string `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	err = json.Unmarshal(resp, &result)
-	return result.BlockHeader.RawData.Number, err
+
+	err = json.Unmarshal(resp, &rpcResp)
+	if err != nil {
+		return 0, err
+	}
+
+	if rpcResp.Error != nil {
+		return 0, fmt.Errorf("RPC Error: %s", rpcResp.Error.Message)
+	}
+
+	blockNum, ok := new(big.Int).SetString(rpcResp.Result[2:], 16)
+	if !ok {
+		return 0, fmt.Errorf("failed to parse block number")
+	}
+
+	return blockNum.Int64(), nil
 }
 
 func getBlockByNum(num int64) (*Block, error) {
-	body := map[string]interface{}{"num": num}
-	resp, err := post("/wallet/getblockbynum", body)
+	hexNum := fmt.Sprintf("0x%x", num) // convert block number to hex
+
+	payload := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "eth_getBlockByNumber",
+		"params":  []interface{}{hexNum, true},
+		"id":      1,
+	}
+
+	resp, err := postc(payload)
 	if err != nil {
 		return nil, err
 	}
-	var block Block
-	err = json.Unmarshal(resp, &block)
-	return &block, err
 
+	var rpcResp struct {
+		Result *Block `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	err = json.Unmarshal(resp, &rpcResp)
+	if err != nil {
+		return nil, err
+	}
+
+	if rpcResp.Error != nil {
+		return nil, fmt.Errorf("RPC Error: %s", rpcResp.Error.Message)
+	}
+
+	return rpcResp.Result, nil
 }
 
 func keys(m map[string]bool) []string {
