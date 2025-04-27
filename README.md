@@ -1,4 +1,4 @@
-# Blockchain-RPC-Query-
+# Blockchain-RPC-Query
 
 
 # TRON RPC Wallet Explorer (GoLang)
