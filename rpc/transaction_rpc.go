@@ -6,24 +6,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
-
-	"github.com/joho/godotenv"
 )
-
-func init() {
-	var rpcURL string
-	err := godotenv.Load()
-	if err != nil {
-		fmt.Println("Warning: .env file not found, using default RPC URL")
-	}
-	rpcURL = os.Getenv("RPC_URL")
-	if rpcURL == "" {
-		panic("RPC_URL not set in environment")
-	}
-}
 
 type TronscanTransaction struct {
 	OwnerAddress string `json:"ownerAddress"`
@@ -43,16 +28,18 @@ type EthBlock struct {
 	Transactions []EthTransaction `json:"transactions"`
 }
 
-// ✅ Fetch payers: who sent to my address
+// Fetch payers: who sent to my address
 func FetchPayers(address string, limit int) ([]string, error) {
 	if strings.HasPrefix(address, "0x") {
+		fmt.Println("Fatching Payers")
 		return fetchEthPayers(address, limit)
 	} else {
+		fmt.Println("Fatching tron payers")
 		return fetchTronPayers(address, limit)
 	}
 }
 
-// ✅ Fetch beneficiaries: where my address sent to
+// Fetch beneficiaries: where my address sent to
 func FetchBeneficiaries(address string, limit int) ([]string, error) {
 	if strings.HasPrefix(address, "0x") {
 		return fetchEthBeneficiaries(address, limit)
@@ -63,6 +50,7 @@ func FetchBeneficiaries(address string, limit int) ([]string, error) {
 
 func fetchTronPayers(address string, limit int) ([]string, error) {
 	url := fmt.Sprintf("https://apilist.tronscanapi.com/api/transaction?address=%s&limit=%d&sort=-timestamp", address, limit)
+
 	client := &http.Client{}
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
@@ -74,11 +62,6 @@ func fetchTronPayers(address string, limit int) ([]string, error) {
 	defer resp.Body.Close()
 
 	body, _ := ioutil.ReadAll(resp.Body)
-
-	// fmt.Println("=== RAW Tronscan API Response ===")
-	// // fmt.Println(string(body))
-	// fmt.Println("===============================")
-
 	var apiResp TronscanResponse
 	err = json.Unmarshal(body, &apiResp)
 	if err != nil {
@@ -89,7 +72,10 @@ func fetchTronPayers(address string, limit int) ([]string, error) {
 	for _, tx := range apiResp.Data {
 		if tx.ToAddress == address {
 			payers[tx.OwnerAddress] = true
+		} else if tx.OwnerAddress == address {
+			payers[tx.ToAddress] = true
 		}
+
 	}
 
 	return keys(payers), nil
@@ -131,6 +117,8 @@ func fetchTronBeneficiaries(address string, limit int) ([]string, error) {
 
 func fetchEthPayers(address string, limit int) ([]string, error) {
 	latestBlock, err := getLatestEthBlockNumber()
+	fmt.Println("Sandeep payers")
+	fmt.Println(latestBlock)
 	if err != nil {
 		return nil, err
 	}
