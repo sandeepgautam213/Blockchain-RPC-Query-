@@ -1,89 +1,219 @@
 package rpc
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"math/big"
+	"io/ioutil"
+	"net/http"
+	"os"
+	"strings"
 	"sync"
+
+	"github.com/joho/godotenv"
 )
 
-type Block struct {
-	Number       string        `json:"number"`
-	Hash         string        `json:"hash"`
-	Transactions []Transaction `json:"transactions"`
-}
-
-type Transaction struct {
-	Hash  string `json:"hash"`
-	From  string `json:"from"`
-	To    string `json:"to"`
-	Value string `json:"value"`
-}
-
-func FetchPayers(address string, blockRange int64) ([]string, error) {
-	payers := make(map[string]bool)
-	err := scanBlocks(address, blockRange, func(from, to string) {
-		if to == address {
-			payers[from] = true
-		}
-	})
-	return keys(payers), err
-}
-
-func FetchBeneficiaries(address string, blockRange int64) ([]string, error) {
-	beneficiaries := make(map[string]bool)
-	err := scanBlocks(address, blockRange, func(from, to string) {
-		if from == address {
-			beneficiaries[to] = true
-		}
-	})
-	return keys(beneficiaries), err
-}
-
-func scanBlocks(address string, blockRange int64, handleTx func(from, to string)) error {
-	latest, err := getLatestBlockNumber()
+func init() {
+	var rpcURL string
+	err := godotenv.Load()
 	if err != nil {
-		return err
+		fmt.Println("Warning: .env file not found, using default RPC URL")
 	}
+	rpcURL = os.Getenv("RPC_URL")
+	if rpcURL == "" {
+		panic("RPC_URL not set in environment")
+	}
+}
+
+type TronscanTransaction struct {
+	OwnerAddress string `json:"ownerAddress"`
+	ToAddress    string `json:"toAddress"`
+}
+
+type TronscanResponse struct {
+	Data []TronscanTransaction `json:"data"`
+}
+
+type EthTransaction struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type EthBlock struct {
+	Transactions []EthTransaction `json:"transactions"`
+}
+
+// ✅ Fetch payers: who sent to my address
+func FetchPayers(address string, limit int) ([]string, error) {
+	if strings.HasPrefix(address, "0x") {
+		return fetchEthPayers(address, limit)
+	} else {
+		return fetchTronPayers(address, limit)
+	}
+}
+
+// ✅ Fetch beneficiaries: where my address sent to
+func FetchBeneficiaries(address string, limit int) ([]string, error) {
+	if strings.HasPrefix(address, "0x") {
+		return fetchEthBeneficiaries(address, limit)
+	} else {
+		return fetchTronBeneficiaries(address, limit)
+	}
+}
+
+func fetchTronPayers(address string, limit int) ([]string, error) {
+	url := fmt.Sprintf("https://apilist.tronscanapi.com/api/transaction?address=%s&limit=%d&sort=-timestamp", address, limit)
+	client := &http.Client{}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := ioutil.ReadAll(resp.Body)
+
+	// fmt.Println("=== RAW Tronscan API Response ===")
+	// // fmt.Println(string(body))
+	// fmt.Println("===============================")
+
+	var apiResp TronscanResponse
+	err = json.Unmarshal(body, &apiResp)
+	if err != nil {
+		return nil, err
+	}
+
+	payers := make(map[string]bool)
+	for _, tx := range apiResp.Data {
+		if tx.ToAddress == address {
+			payers[tx.OwnerAddress] = true
+		}
+	}
+
+	return keys(payers), nil
+}
+
+func fetchTronBeneficiaries(address string, limit int) ([]string, error) {
+	url := fmt.Sprintf("https://apilist.tronscanapi.com/api/transaction?address=%s&limit=%d&sort=-timestamp", address, limit)
+	client := &http.Client{}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := ioutil.ReadAll(resp.Body)
+
+	// fmt.Println("=== RAW Tronscan API Response ===")
+	// // fmt.Println(string(body))
+	// fmt.Println("===============================")
+
+	var apiResp TronscanResponse
+	err = json.Unmarshal(body, &apiResp)
+	if err != nil {
+		return nil, err
+	}
+
+	beneficiaries := make(map[string]bool)
+	for _, tx := range apiResp.Data {
+		if tx.OwnerAddress == address {
+			beneficiaries[tx.ToAddress] = true
+		}
+	}
+
+	return keys(beneficiaries), nil
+}
+
+func fetchEthPayers(address string, limit int) ([]string, error) {
+	latestBlock, err := getLatestEthBlockNumber()
+	if err != nil {
+		return nil, err
+	}
+
+	payers := make(map[string]bool)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	sem := make(chan struct{}, 5) // limit concurrency to 5
+	sem := make(chan struct{}, 5)
 
-	for i := latest; i >= latest-blockRange; i-- {
+	for i := 0; i < limit; i++ {
 		wg.Add(1)
 		sem <- struct{}{}
 
-		go func(num int64) {
+		go func(i int) {
 			defer func() {
 				wg.Done()
 				<-sem
 			}()
 
-			block, err := getBlockByNum(num)
+			blockNumber := latestBlock - int64(i)
+			block, err := getEthBlockByNumber(blockNumber)
 			if err != nil {
 				return
 			}
 
 			for _, tx := range block.Transactions {
-				from := tx.From
-				to := tx.To
-
-				if from == "" || to == "" {
-					continue
+				if strings.EqualFold(tx.To, address) {
+					mu.Lock()
+					payers[tx.From] = true
+					mu.Unlock()
 				}
-
-				mu.Lock()
-				handleTx(from, to)
-				mu.Unlock()
 			}
 		}(i)
 	}
 	wg.Wait()
-	return nil
+
+	return keys(payers), nil
 }
 
-func getLatestBlockNumber() (int64, error) {
+func fetchEthBeneficiaries(address string, limit int) ([]string, error) {
+	latestBlock, err := getLatestEthBlockNumber()
+	if err != nil {
+		return nil, err
+	}
+
+	beneficiaries := make(map[string]bool)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, 5)
+
+	for i := 0; i < limit; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(i int) {
+			defer func() {
+				wg.Done()
+				<-sem
+			}()
+
+			blockNumber := latestBlock - int64(i)
+			block, err := getEthBlockByNumber(blockNumber)
+			if err != nil {
+				return
+			}
+
+			for _, tx := range block.Transactions {
+				if strings.EqualFold(tx.From, address) {
+					mu.Lock()
+					beneficiaries[tx.To] = true
+					mu.Unlock()
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	return keys(beneficiaries), nil
+}
+
+func getLatestEthBlockNumber() (int64, error) {
 	payload := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"method":  "eth_blockNumber",
@@ -91,69 +221,58 @@ func getLatestBlockNumber() (int64, error) {
 		"id":      1,
 	}
 
-	resp, err := postc(payload)
+	resp, err := postEthRPC(payload)
 	if err != nil {
 		return 0, err
 	}
 
 	var rpcResp struct {
 		Result string `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
 	}
-
 	err = json.Unmarshal(resp, &rpcResp)
 	if err != nil {
 		return 0, err
 	}
 
-	if rpcResp.Error != nil {
-		return 0, fmt.Errorf("RPC Error: %s", rpcResp.Error.Message)
-	}
-
-	blockNum, ok := new(big.Int).SetString(rpcResp.Result[2:], 16)
-	if !ok {
-		return 0, fmt.Errorf("failed to parse block number")
-	}
-
-	return blockNum.Int64(), nil
+	var blockNumber int64
+	fmt.Sscanf(rpcResp.Result, "0x%x", &blockNumber)
+	return blockNumber, nil
 }
 
-func getBlockByNum(num int64) (*Block, error) {
-	hexNum := fmt.Sprintf("0x%x", num) // convert block number to hex
-
+func getEthBlockByNumber(num int64) (*EthBlock, error) {
 	payload := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"method":  "eth_getBlockByNumber",
-		"params":  []interface{}{hexNum, true},
+		"params":  []interface{}{fmt.Sprintf("0x%x", num), true},
 		"id":      1,
 	}
 
-	resp, err := postc(payload)
+	resp, err := postEthRPC(payload)
 	if err != nil {
 		return nil, err
 	}
 
 	var rpcResp struct {
-		Result *Block `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
+		Result EthBlock `json:"result"`
 	}
-
 	err = json.Unmarshal(resp, &rpcResp)
 	if err != nil {
 		return nil, err
 	}
 
-	if rpcResp.Error != nil {
-		return nil, fmt.Errorf("RPC Error: %s", rpcResp.Error.Message)
-	}
+	return &rpcResp.Result, nil
+}
 
-	return rpcResp.Result, nil
+func postEthRPC(payload map[string]interface{}) ([]byte, error) {
+	jsonData, _ := json.Marshal(payload)
+
+	resp, err := http.Post(rpcURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	return ioutil.ReadAll(resp.Body)
 }
 
 func keys(m map[string]bool) []string {
