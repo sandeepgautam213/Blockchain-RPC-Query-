@@ -8,25 +8,9 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	db "tron_rpc/database"
+	"tron_rpc/models"
 )
-
-type TronscanTransaction struct {
-	OwnerAddress string `json:"ownerAddress"`
-	ToAddress    string `json:"toAddress"`
-}
-
-type TronscanResponse struct {
-	Data []TronscanTransaction `json:"data"`
-}
-
-type EthTransaction struct {
-	From string `json:"from"`
-	To   string `json:"to"`
-}
-
-type EthBlock struct {
-	Transactions []EthTransaction `json:"transactions"`
-}
 
 // Fetch payers: who sent to my address
 func FetchPayers(address string, targetCount int, maxDepth int) ([]string, error) {
@@ -71,6 +55,10 @@ func fetchTronPayers(address string, targetCount, maxDepth int) ([]string, error
 			default:
 			}
 
+			if db.BlockExists(blockNum) {
+				return
+			}
+
 			block, err := getTronBlockByNumber(blockNum)
 			if err != nil {
 				return
@@ -82,6 +70,9 @@ func fetchTronPayers(address string, targetCount, maxDepth int) ([]string, error
 				if toAddr == address {
 					resultCh <- fromAddr
 				}
+
+				db.StoreBlockAndTx(*block)
+
 			}
 		}(i)
 	}
@@ -89,6 +80,8 @@ func fetchTronPayers(address string, targetCount, maxDepth int) ([]string, error
 	go func() {
 		wg.Wait()
 		close(resultCh)
+		_ = db.PruneOldData(latestBlock) // clean old data if needed
+
 	}()
 
 LOOP:
@@ -130,6 +123,10 @@ func fetchTronBeneficiaries(address string, targetCount, maxDepth int) ([]string
 			default:
 			}
 
+			if db.BlockExists(blockNum) {
+				return
+			}
+
 			block, err := getTronBlockByNumber(blockNum)
 			if err != nil {
 				return
@@ -138,9 +135,13 @@ func fetchTronBeneficiaries(address string, targetCount, maxDepth int) ([]string
 			for _, tx := range block.Transactions {
 				fromAddr, _ := hexToTronAddress(tx.Owner)
 				toAddr, _ := hexToTronAddress(tx.To)
+
 				if fromAddr == address {
 					resultCh <- toAddr
 				}
+
+				db.StoreBlockAndTx(*block)
+
 			}
 		}(i)
 	}
@@ -148,6 +149,7 @@ func fetchTronBeneficiaries(address string, targetCount, maxDepth int) ([]string
 	go func() {
 		wg.Wait()
 		close(resultCh)
+		_ = db.PruneOldData(latestBlock)
 	}()
 
 LOOP:
@@ -155,7 +157,7 @@ LOOP:
 		mu.Lock()
 		if len(beneficiaries) >= targetCount {
 			mu.Unlock()
-			close(stopCh) // stop signal
+			close(stopCh)
 			break LOOP
 		}
 		beneficiaries[b] = true
@@ -167,8 +169,8 @@ LOOP:
 
 func fetchEthPayers(address string, limit int, maxDepth int) ([]string, error) {
 	latestBlock, err := getLatestEthBlockNumber()
-	fmt.Println("Sandeep payers")
-	fmt.Println(latestBlock)
+	// fmt.Println("Sandeep payers")
+	// fmt.Println(latestBlock)
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +279,7 @@ func getLatestEthBlockNumber() (int64, error) {
 	return blockNumber, nil
 }
 
-func getEthBlockByNumber(num int64) (*EthBlock, error) {
+func getEthBlockByNumber(num int64) (*models.EthBlock, error) {
 	payload := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"method":  "eth_getBlockByNumber",
@@ -291,7 +293,7 @@ func getEthBlockByNumber(num int64) (*EthBlock, error) {
 	}
 
 	var rpcResp struct {
-		Result EthBlock `json:"result"`
+		Result models.EthBlock `json:"result"`
 	}
 	err = json.Unmarshal(resp, &rpcResp)
 	if err != nil {

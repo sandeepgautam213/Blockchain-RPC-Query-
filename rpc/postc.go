@@ -8,9 +8,13 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"crypto/sha256"
+
+	"tron_rpc/models"
 
 	"github.com/btcsuite/btcutil/base58"
 	"github.com/joho/godotenv"
@@ -27,15 +31,6 @@ func init() {
 	if rpcURL == "" {
 		fmt.Println("rpc url not found")
 	}
-}
-
-type TronTransaction struct {
-	Owner string
-	To    string
-}
-
-type TronBlock struct {
-	Transactions []TronTransaction
 }
 
 func getLatestTronBlockNumber() (int64, error) {
@@ -63,7 +58,7 @@ func getLatestTronBlockNumber() (int64, error) {
 	return blockNumber, nil
 }
 
-func getTronBlockByNumber(blockNum int64) (*TronBlock, error) {
+func getTronBlockByNumber(blockNum int64) (*models.TronBlock, error) {
 	payload := map[string]interface{}{
 		"method": "eth_getBlockByNumber",
 		"params": []interface{}{fmt.Sprintf("0x%x", blockNum), true},
@@ -77,22 +72,60 @@ func getTronBlockByNumber(blockNum int64) (*TronBlock, error) {
 
 	var raw struct {
 		Result struct {
+			Number       string `json:"number"`
+			Timestamp    string `json:"timestamp"`
+			Hash         string `json:"hash"`
 			Transactions []struct {
-				From string `json:"from"`
-				To   string `json:"to"`
+				Hash           string `json:"hash"`
+				From           string `json:"from"`
+				To             string `json:"to"`
+				Value          string `json:"value"`
+				Input          string `json:"input"`
+				BlockTimestamp string `json:"timestamp"` // fallback if present
 			} `json:"transactions"`
 		} `json:"result"`
 	}
+
 	err = json.Unmarshal(resp, &raw)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse block response: %w", err)
 	}
 
-	block := &TronBlock{}
+	blockNumber, err := strconv.ParseInt(raw.Result.Number, 0, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid block number: %w", err)
+	}
+
+	timestampUnix, err := strconv.ParseInt(raw.Result.Timestamp, 0, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid block timestamp: %w", err)
+	}
+	blockTimestamp := time.UnixMilli(timestampUnix)
+
+	block := &models.TronBlock{
+		BlockNumber:  blockNumber,
+		Timestamp:    blockTimestamp,
+		Hash:         raw.Result.Hash,
+		Transactions: []models.TronTransaction{},
+	}
+
 	for _, tx := range raw.Result.Transactions {
-		block.Transactions = append(block.Transactions, TronTransaction{
-			Owner: tx.From,
-			To:    tx.To,
+		amount, _ := strconv.ParseInt(tx.Value, 0, 64)
+
+		txTime := blockTimestamp
+		if tx.BlockTimestamp != "" {
+			if t, err := strconv.ParseInt(tx.BlockTimestamp, 0, 64); err == nil {
+				txTime = time.UnixMilli(t)
+			}
+		}
+
+		block.Transactions = append(block.Transactions, models.TronTransaction{
+			TxID:         tx.Hash,
+			Owner:        tx.From,
+			To:           tx.To,
+			Amount:       amount,
+			ContractType: detectContractType(tx.Input),
+			Timestamp:    txTime,
 		})
 	}
 
@@ -132,4 +165,16 @@ func hexToTronAddress(hexAddr string) (string, error) {
 	fullAddrWithChecksum := append(fullAddr, checksum...)
 
 	return base58.Encode(fullAddrWithChecksum), nil
+}
+func detectContractType(input string) string {
+	if len(input) < 10 {
+		return "transfer"
+	}
+	// Example: Detect based on known function selectors
+	switch input[:10] {
+	case "0xa9059cbb":
+		return "TRC20 transfer"
+	default:
+		return "contract call"
+	}
 }
