@@ -12,7 +12,7 @@ func PayerAddress(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Please mention address", http.StatusBadRequest)
 		return
 	}
-	payers, err := rpc.FetchPayers(address, 1000)
+	payers, err := rpc.FetchPayers(address, targetCount, maxDepth)
 	if err != nil {
 		http.Error(w, "Error fetching payers:"+err.Error(), http.StatusInternalServerError)
 		return

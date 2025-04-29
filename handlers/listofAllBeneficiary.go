@@ -7,6 +7,9 @@ import (
 	"tron_rpc/rpc"
 )
 
+const maxDepth int = 100000
+const targetCount int = 6
+
 func ListOfAllBeneficiary(w http.ResponseWriter, r *http.Request) {
 	address := r.URL.Query().Get("address")
 	if address == "" {
@@ -15,14 +18,14 @@ func ListOfAllBeneficiary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch payers
-	payers, err := rpc.FetchPayers(address, 50)
+	payers, err := rpc.FetchPayers(address, targetCount, maxDepth)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Error fetching payers: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	// Fetch beneficiaries
-	beneficiaries, err := rpc.FetchBeneficiaries(address, 50)
+	beneficiaries, err := rpc.FetchBeneficiaries(address, targetCount, maxDepth)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Error fetching beneficiaries: %v", err), http.StatusInternalServerError)
 		return

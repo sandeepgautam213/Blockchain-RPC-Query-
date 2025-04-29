@@ -29,93 +29,143 @@ type EthBlock struct {
 }
 
 // Fetch payers: who sent to my address
-func FetchPayers(address string, limit int) ([]string, error) {
+func FetchPayers(address string, targetCount int, maxDepth int) ([]string, error) {
 	if strings.HasPrefix(address, "0x") {
 		fmt.Println("Fatching Payers")
-		return fetchEthPayers(address, limit)
+		return fetchEthPayers(address, targetCount, maxDepth)
 	} else {
 		fmt.Println("Fatching tron payers")
-		return fetchTronPayers(address, limit)
+		return fetchTronPayers(address, targetCount, maxDepth)
 	}
 }
 
 // Fetch beneficiaries: where my address sent to
-func FetchBeneficiaries(address string, limit int) ([]string, error) {
+func FetchBeneficiaries(address string, targetCount int, maxDepth int) ([]string, error) {
 	if strings.HasPrefix(address, "0x") {
-		return fetchEthBeneficiaries(address, limit)
+		return fetchEthBeneficiaries(address, targetCount, maxDepth)
 	} else {
-		return fetchTronBeneficiaries(address, limit)
+		return fetchTronBeneficiaries(address, targetCount, maxDepth)
 	}
 }
-
-func fetchTronPayers(address string, limit int) ([]string, error) {
-	url := fmt.Sprintf("https://apilist.tronscanapi.com/api/transaction?address=%s&limit=%d&sort=-timestamp", address, limit)
-
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, _ := ioutil.ReadAll(resp.Body)
-	var apiResp TronscanResponse
-	err = json.Unmarshal(body, &apiResp)
-	if err != nil {
-		return nil, err
-	}
-
+func fetchTronPayers(address string, targetCount, maxDepth int) ([]string, error) {
 	payers := make(map[string]bool)
-	for _, tx := range apiResp.Data {
-		if tx.ToAddress == address {
-			payers[tx.OwnerAddress] = true
-		} else if tx.OwnerAddress == address {
-			payers[tx.ToAddress] = true
-		}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	resultCh := make(chan string, maxDepth)
+	stopCh := make(chan struct{})
 
+	latestBlock, err := getLatestTronBlockNumber()
+	if err != nil {
+		return nil, err
+	}
+
+	for i := 0; i < maxDepth; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			blockNum := latestBlock - int64(i)
+
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+
+			block, err := getTronBlockByNumber(blockNum)
+			if err != nil {
+				return
+			}
+
+			for _, tx := range block.Transactions {
+				fromAddr, _ := hexToTronAddress(tx.Owner)
+				toAddr, _ := hexToTronAddress(tx.To)
+				if toAddr == address {
+					resultCh <- fromAddr
+				}
+			}
+		}(i)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+LOOP:
+	for payer := range resultCh {
+		mu.Lock()
+		if len(payers) >= targetCount {
+			mu.Unlock()
+			close(stopCh) // signal goroutines to stop
+			break LOOP
+		}
+		payers[payer] = true
+		mu.Unlock()
 	}
 
 	return keys(payers), nil
 }
 
-func fetchTronBeneficiaries(address string, limit int) ([]string, error) {
-	url := fmt.Sprintf("https://apilist.tronscanapi.com/api/transaction?address=%s&limit=%d&sort=-timestamp", address, limit)
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, _ := ioutil.ReadAll(resp.Body)
-
-	// fmt.Println("=== RAW Tronscan API Response ===")
-	// // fmt.Println(string(body))
-	// fmt.Println("===============================")
-
-	var apiResp TronscanResponse
-	err = json.Unmarshal(body, &apiResp)
-	if err != nil {
-		return nil, err
-	}
-
+func fetchTronBeneficiaries(address string, targetCount, maxDepth int) ([]string, error) {
 	beneficiaries := make(map[string]bool)
-	for _, tx := range apiResp.Data {
-		if tx.OwnerAddress == address {
-			beneficiaries[tx.ToAddress] = true
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	resultCh := make(chan string, maxDepth)
+	stopCh := make(chan struct{})
+
+	latestBlock, err := getLatestTronBlockNumber()
+	if err != nil {
+		return nil, err
+	}
+
+	for i := 0; i < maxDepth; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			blockNum := latestBlock - int64(i)
+
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+
+			block, err := getTronBlockByNumber(blockNum)
+			if err != nil {
+				return
+			}
+
+			for _, tx := range block.Transactions {
+				fromAddr, _ := hexToTronAddress(tx.Owner)
+				toAddr, _ := hexToTronAddress(tx.To)
+				if fromAddr == address {
+					resultCh <- toAddr
+				}
+			}
+		}(i)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+LOOP:
+	for b := range resultCh {
+		mu.Lock()
+		if len(beneficiaries) >= targetCount {
+			mu.Unlock()
+			close(stopCh) // stop signal
+			break LOOP
 		}
+		beneficiaries[b] = true
+		mu.Unlock()
 	}
 
 	return keys(beneficiaries), nil
 }
 
-func fetchEthPayers(address string, limit int) ([]string, error) {
+func fetchEthPayers(address string, limit int, maxDepth int) ([]string, error) {
 	latestBlock, err := getLatestEthBlockNumber()
 	fmt.Println("Sandeep payers")
 	fmt.Println(latestBlock)
@@ -159,7 +209,7 @@ func fetchEthPayers(address string, limit int) ([]string, error) {
 	return keys(payers), nil
 }
 
-func fetchEthBeneficiaries(address string, limit int) ([]string, error) {
+func fetchEthBeneficiaries(address string, limit int, maxDepth int) ([]string, error) {
 	latestBlock, err := getLatestEthBlockNumber()
 	if err != nil {
 		return nil, err
