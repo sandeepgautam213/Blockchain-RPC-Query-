@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 	db "tron_rpc/database"
 	"tron_rpc/models"
 )
@@ -32,139 +34,64 @@ func FetchBeneficiaries(address string, targetCount int, maxDepth int) ([]string
 	}
 }
 func fetchTronPayers(address string, targetCount, maxDepth int) ([]string, error) {
-	payers := make(map[string]bool)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	resultCh := make(chan string, maxDepth)
-	stopCh := make(chan struct{})
-
-	latestBlock, err := getLatestTronBlockNumber()
+	rows, err := db.DB.Query(`
+		SELECT from_address FROM tron_transactions
+		WHERE to_address = $1
+		ORDER BY block_number DESC
+		LIMIT $2
+	`, address, maxDepth*20) // scale factor
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("payer query failed: %v", err)
 	}
+	defer rows.Close()
 
-	for i := 0; i < maxDepth; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			blockNum := latestBlock - int64(i)
-
-			select {
-			case <-stopCh:
-				return
-			default:
-			}
-
-			if db.BlockExists(blockNum) {
-				return
-			}
-
-			block, err := getTronBlockByNumber(blockNum)
-			if err != nil {
-				return
-			}
-
-			for _, tx := range block.Transactions {
-				fromAddr, _ := hexToTronAddress(tx.Owner)
-				toAddr, _ := hexToTronAddress(tx.To)
-				if toAddr == address {
-					resultCh <- fromAddr
-				}
-
-				db.StoreBlockAndTx(*block)
-
-			}
-		}(i)
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultCh)
-		_ = db.PruneOldData(latestBlock) // clean old data if needed
-
-	}()
-
-LOOP:
-	for payer := range resultCh {
-		mu.Lock()
-		if len(payers) >= targetCount {
-			mu.Unlock()
-			close(stopCh) // signal goroutines to stop
-			break LOOP
+	payers := make(map[string]struct{})
+	for rows.Next() {
+		var from string
+		if err := rows.Scan(&from); err != nil {
+			continue
 		}
-		payers[payer] = true
-		mu.Unlock()
+		payers[from] = struct{}{}
+		if len(payers) >= targetCount {
+			break
+		}
 	}
 
-	return keys(payers), nil
+	return keysFromMap(payers), nil
 }
 
 func fetchTronBeneficiaries(address string, targetCount, maxDepth int) ([]string, error) {
-	beneficiaries := make(map[string]bool)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	resultCh := make(chan string, maxDepth)
-	stopCh := make(chan struct{})
-
-	latestBlock, err := getLatestTronBlockNumber()
+	rows, err := db.DB.Query(`
+		SELECT to_address FROM tron_transactions
+		WHERE from_address = $1
+		ORDER BY block_number DESC
+		LIMIT $2
+	`, address, maxDepth*20)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("beneficiary query failed: %v", err)
 	}
+	defer rows.Close()
 
-	for i := 0; i < maxDepth; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			blockNum := latestBlock - int64(i)
-
-			select {
-			case <-stopCh:
-				return
-			default:
-			}
-
-			if db.BlockExists(blockNum) {
-				return
-			}
-
-			block, err := getTronBlockByNumber(blockNum)
-			if err != nil {
-				return
-			}
-
-			for _, tx := range block.Transactions {
-				fromAddr, _ := hexToTronAddress(tx.Owner)
-				toAddr, _ := hexToTronAddress(tx.To)
-
-				if fromAddr == address {
-					resultCh <- toAddr
-				}
-
-				db.StoreBlockAndTx(*block)
-
-			}
-		}(i)
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultCh)
-		_ = db.PruneOldData(latestBlock)
-	}()
-
-LOOP:
-	for b := range resultCh {
-		mu.Lock()
-		if len(beneficiaries) >= targetCount {
-			mu.Unlock()
-			close(stopCh)
-			break LOOP
+	beneficiaries := make(map[string]struct{})
+	for rows.Next() {
+		var to string
+		if err := rows.Scan(&to); err != nil {
+			continue
 		}
-		beneficiaries[b] = true
-		mu.Unlock()
+		beneficiaries[to] = struct{}{}
+		if len(beneficiaries) >= targetCount {
+			break
+		}
 	}
 
-	return keys(beneficiaries), nil
+	return keysFromMap(beneficiaries), nil
+}
+func keysFromMap(m map[string]struct{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func fetchEthPayers(address string, limit int, maxDepth int) ([]string, error) {
@@ -321,4 +248,69 @@ func keys(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+const (
+	batchSize     = 10
+	maxConcurrent = 5
+)
+
+func StartBlockSyncer() {
+	sem := make(chan struct{}, maxConcurrent) // limit concurrency
+
+	for {
+		latestChainBlock, err := getLatestTronBlockNumber()
+		if err != nil {
+			log.Printf("Failed to get latest block: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		latestStored, err := db.GetLatestStoredBlock()
+		if err != nil {
+			log.Printf("Failed to get latest stored block: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		if latestStored >= latestChainBlock {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		var wg sync.WaitGroup
+
+		for b := latestStored + 1; b <= latestChainBlock; b += batchSize {
+			end := b + batchSize - 1
+			if end > latestChainBlock {
+				end = latestChainBlock
+			}
+
+			wg.Add(1)
+			sem <- struct{}{} // acquire
+
+			go func(start, end int64) {
+				defer wg.Done()
+				defer func() { <-sem }() // release
+
+				for i := start; i <= end; i++ {
+					block, err := getTronBlockByNumber(int64(i))
+					if err != nil {
+						log.Printf("Error fetching block %d: %v", i, err)
+						return
+					}
+					if err := db.StoreBlockAndTx(*block); err != nil {
+						log.Printf("Error storing block %d: %v", i, err)
+						return
+					}
+					if err := db.EnforceMaxDBSize(6000); err != nil {
+						log.Printf("DB size enforcement failed: %v", err)
+					}
+					log.Printf("Synced block %d", i)
+				}
+			}(b, end)
+		}
+
+		wg.Wait()
+	}
 }

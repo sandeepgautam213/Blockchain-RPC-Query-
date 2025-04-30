@@ -122,3 +122,11 @@ func PruneOldData(currentBlock int64) error {
 	`, cutoff, cutoff)
 	return err
 }
+func GetLatestStoredBlock() (int64, error) {
+	var blockNum int64
+	err := DB.QueryRow(`SELECT MAX(block_number) FROM tron_blocks`).Scan(&blockNum)
+	if err != nil {
+		return 0, err
+	}
+	return blockNum, nil
+}
