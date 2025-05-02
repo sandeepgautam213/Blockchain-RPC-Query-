@@ -12,6 +12,8 @@ import (
 
 var DB *sql.DB
 
+const startBlockNum = 71779551
+
 func InitDB() {
 	connStr := fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
@@ -123,10 +125,14 @@ func PruneOldData(currentBlock int64) error {
 	return err
 }
 func GetLatestStoredBlock() (int64, error) {
-	var blockNum int64
+	var blockNum sql.NullInt64
 	err := DB.QueryRow(`SELECT MAX(block_number) FROM tron_blocks`).Scan(&blockNum)
 	if err != nil {
 		return 0, err
 	}
-	return blockNum, nil
+	if blockNum.Valid {
+		return blockNum.Int64, nil
+	}
+	// Table is empty; return default block number (e.g., 0)
+	return startBlockNum, nil
 }

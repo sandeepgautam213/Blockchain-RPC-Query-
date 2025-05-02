@@ -119,14 +119,27 @@ func getTronBlockByNumber(blockNum int64) (*models.TronBlock, error) {
 			}
 		}
 
+		fromAddr, err := hexToTronAddress(tx.From)
+		if err != nil {
+			fromAddr = tx.From // fallback to hex if conversion fails
+		}
+
+		toAddr := tx.To
+		if toAddr != "" {
+			if converted, err := hexToTronAddress(toAddr); err == nil {
+				toAddr = converted
+			}
+		}
+
 		block.Transactions = append(block.Transactions, models.TronTransaction{
-			TxID:         tx.Hash,
-			Owner:        tx.From,
-			To:           tx.To,
+			TxID:         strings.TrimPrefix(tx.Hash, "0x"),
+			Owner:        fromAddr,
+			To:           toAddr,
 			Amount:       amount,
 			ContractType: detectContractType(tx.Input),
 			Timestamp:    txTime,
 		})
+
 	}
 
 	return block, nil
